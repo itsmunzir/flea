@@ -35,3 +35,13 @@ fn unusable() -> Option<String> {
     let text = String::from_utf8_lossy(&out.stderr);
     Some(text.lines().next().unwrap_or("it exited non-zero and said nothing").to_string())
 }
+
+// The soft "Max cpu time" column of this test process, in the kernel's own spelling: "unlimited" for
+// RLIM_INFINITY, otherwise the seconds. A jail built with no `--cpu` leaves exactly this in place, so the
+// tests read it rather than writing a literal: a suite started under `ulimit -t 120` gives such a child
+// 120, and a hard-coded "unlimited" would fail on that box rather than on a bare one.
+pub fn inherited_cpu_limit() -> String {
+    let text = std::fs::read_to_string("/proc/self/limits").expect("this process's own limits");
+    text.lines().find(|l| l.starts_with("Max cpu time")).expect("a Max cpu time row")
+        .split_whitespace().nth(3).expect("the soft column").to_string()
+}

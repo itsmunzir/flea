@@ -111,6 +111,13 @@ fn failure_message(what: &str, status: &ExitStatus, stderr: &str) -> String {
 // what names the operation this jail is running, because the same jail runs the archive tools and
 // the image converter: reporting every one of them as "archive" told an operator converting a PNG
 // that the archive tool had failed.
+//
+// This runner is blocking and holds no cancel token, so it keeps the decoder's `wrap` and its
+// `--cpu=30`: that cap is the only stop a compressor or a converter that never exits can meet, and
+// `.output()` below waits for exactly as long as it allows. Issue #211's uncapped jail belongs to
+// `run_boxed_cancellable` alone, where an extract may legitimately outrun 30 CPU seconds and the
+// operator's Cancel is the stop instead. Keeping compress and convert capped here is what stops the
+// #211 change from turning them into an indefinite wait.
 pub fn run_boxed(what: &str, inner: Vec<String>, read_only: &Path, writable: &Path) -> Result<(), FleaError> {
     // Fail closed: the jail is the only containment for these tools, so a missing bwrap or prlimit
     // refuses the job rather than running it unsandboxed, the same rule thumbs.rs already follows.
@@ -118,7 +125,7 @@ pub fn run_boxed(what: &str, inner: Vec<String>, read_only: &Path, writable: &Pa
         let tool = inner.first().map_or("", |s| s.as_str());
         return Err(op_err(what, tool, "the sandbox is unavailable: bwrap or prlimit is not on PATH"));
     }
-    let full = sandbox::wrap_archive(&inner, read_only, writable);
+    let full = sandbox::wrap(&inner, read_only, writable);
     let out = Command::new(&full[0])
         .args(&full[1..])
         .stdin(std::process::Stdio::null())
@@ -134,6 +141,9 @@ pub fn run_boxed(what: &str, inner: Vec<String>, read_only: &Path, writable: &Pa
 
 
 // run_boxed, watched for a cancel: kill and reap here, so nothing is renamed and stderr is drained.
+// Extract is the only job that reaches the uncapped `wrap_archive`, because the cancel is the bound
+// that replaces the decoder's 30 s CPU cap; compress and convert stay on `run_boxed`'s capped jail,
+// having no cancel token for that bound to stand in for.
 pub fn run_boxed_cancellable(what: &str, inner: Vec<String>, read_only: &Path, writable: &Path,
                              cancel: &AtomicBool) -> Result<(), FleaError> {
     run_boxed_cancellable_inner(what, inner, read_only, writable, cancel, None)

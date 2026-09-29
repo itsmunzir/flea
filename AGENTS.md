@@ -1586,7 +1586,7 @@ failure fails the check rather than passing it.
 - `backend/thumbcache.rs` names and reads entries in the shared thumbnail cache, see
   "Thumbnail cache".
 - `backend/thumbwrite.rs` creates the temp, stamps the PNG and writes the fail marker.
-- `backend/sandbox.rs` wraps a thumbnailer's argv in bwrap and prlimit, and the archive jobs' argv in
+- `backend/sandbox.rs` wraps a thumbnailer's argv in bwrap and prlimit, and an extract's argv in
   that same jail without the CPU cap, see "Thumbnail sandbox".
 - `backend/child.rs` runs one argv under a deadline and says whether it succeeded, failed or
   never started, which is the whole of what decides a `fail/` marker, see "Thumbnail pool".
@@ -3307,11 +3307,16 @@ accepted, because the rung here is the smallest thing that works and the number 
 when somebody brings a measurement. It is still finite and still refuses a decompression
 bomb.
 
-**The archive and convert jobs get this jail without the CPU cap, and that is issue #211.** `wrap` is
-the decoder's wrapper; `sandbox::wrap_archive` is the one `archivework.rs` builds — `run_boxed` for
-compress and convert, `run_boxed_cancellable` for extract — and it is the same flags, the same
-read-only input, the same single writable path and the same 2 GiB address-space cap with the `--cpu`
-argument left out, `prlimit` still outermost so that cap still arrives. The ticket is a 55 GiB Zip64,
+**The extract gets this jail without the CPU cap, and that is issue #211.** `wrap` is the decoder's
+wrapper; `sandbox::wrap_archive` is the one `archivework.rs`'s `run_boxed_cancellable` builds, for
+extract alone, and it is the same flags, the same read-only input, the same single writable path and
+the same 2 GiB address-space cap with the `--cpu` argument left out, `prlimit` still outermost so
+that cap still arrives. **Compress and convert stay on `wrap` and its 30 s cap.** `run_boxed` is the
+blocking runner and carries no cancel token, so the cap is the only stop a compressor or converter
+that never exits can meet, and `.output()` waits for exactly as long as it allows; the review of this
+change named the indefinite wait that dropping it there would have introduced. Extract is the one job
+with the operator's Cancel to take the cap's place, and it is the one job that legitimately outruns
+30 CPU seconds. The ticket is a 55 GiB Zip64,
 74 GiB unpacked in 676 members, whose legitimate extract `prlimit --cpu=30` killed after 30 s: status
 137, about 24 GiB of the staging tree written, nothing on stderr, and the status bar reported that as
 **"The archive tool failed."** — a sentence that names a bad archive for a job the kernel killed.
@@ -3319,9 +3324,14 @@ Neither zstd nor the tool choice is the cause, as the ticket's own measurements 
 reads the archive's method 93, a one-member extract of that member inside this jail is reported to
 succeed, and `7z` would be launched through the same wrapper and die the same way. **No CPU-second
 number replaces 30**, because every finite one is smaller than the next archive somebody brings, and a
-slow unpack is legitimate work rather than the runaway this bound exists for; what bounds the archive
-class is the address-space cap, `--die-with-parent` and the operator's cancel, which kills and reaps
-the child and discards the staging directory. **The index read keeps the decoder's wrapper
+slow unpack is legitimate work rather than the runaway this bound exists for; what bounds this extract
+is the address-space cap, `--die-with-parent` and the operator's cancel, which kills and reaps
+the child and discards the staging directory. **Both halves are pinned at the kernel, not only in the
+argv.** `sandbox.rs` reads the limit a child really got inside each wrapper, and
+`archivework_tests.rs` runs the two runners themselves — a probe writes the enforced `Max cpu time`
+into the job's writable directory — so a blocking job reads 30 and an extract reads the limit the test
+process inherited, which is the kernel's `unlimited` on a bare box and the shell's own number under
+`ulimit -t`. **The index read keeps the decoder's wrapper
 deliberately**, and its own bound is why: `archivelist.rs` stops a read at `ARCHIVE_READ_MS`, 2 s of
 wall clock, `archive_produced_count_inner` answers `None` for a read that failed, timed out or was
 killed, and `extract` already reads that as unverified rather than as a failure, so a cap biting there

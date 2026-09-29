@@ -69,8 +69,9 @@ fn available_on(path: &str) -> bool {
 }
 
 // The decoder's wrapper: the input is read-only, the one path the caller names is the only writable one,
-// and nothing else is shared. The CPU cap is what makes this the runaway bound; the archive class below
-// builds this same argv without it.
+// and nothing else is shared. The CPU cap is what makes this the runaway bound; the uncapped
+// `wrap_archive` below is this same argv for the one archive job that can be cancelled, and
+// `archivework.rs`'s blocking compress and convert keep this capped one because nothing else stops them.
 pub fn wrap(inner: &[String], input: &Path, out: &Path) -> Vec<String> {
     wrap_with(inner, input, out, Some(CPU_SECONDS))
 }
@@ -82,7 +83,9 @@ pub fn wrap(inner: &[String], input: &Path, out: &Path) -> Vec<String> {
 // No CPU-second number replaces it, because every finite one is smaller than the next archive somebody
 // brings and a runaway unpack is not the failure this layer is for. What bounds the archive class is the
 // address-space cap, `--die-with-parent`, and the operator's cancel, which kills and reaps the child and
-// discards its staging directory. `archivework.rs` is the only caller, for extract, compress and convert.
+// discards its staging directory. `archivework.rs`'s `run_boxed_cancellable` is the only caller, for
+// extract: compress and convert have no cancel token and stay on `wrap`, where that 30 s cap is the only
+// stop a job that never exits can meet.
 pub fn wrap_archive(inner: &[String], input: &Path, out: &Path) -> Vec<String> {
     wrap_with(inner, input, out, None)
 }
@@ -351,21 +354,24 @@ print("over=" + reserve(OVER_MIB))
     }
 
     // Issue #211, at the level the kernel enforces it: the decoder jail must still hold a child to 30 CPU
-    // seconds and the archive jail must hold it to none at all, while both keep the 2 GiB cap that is what
-    // actually confines an unpack. The prober is read from inside each production argv, so this is the
-    // enforced value and not the requested one; the argv test above pins the argument itself.
+    // seconds and the uncapped jail must leave the child at the limit it inherited, while both keep the
+    // 2 GiB cap that is what actually confines an unpack. The prober is read from inside each production
+    // argv, so this is the enforced value and not the requested one; the argv test above pins the argument.
     #[test]
-    fn the_archive_jail_has_no_cpu_limit_where_the_decoder_one_has_thirty_seconds() {
+    fn the_uncapped_jail_inherits_the_cpu_limit_where_the_decoder_one_holds_thirty_seconds() {
         if crate::backend::sandboxprobe::skipped() { return; }
         let d = crate::backend::testdir::TestDir::new("sandboxlimits");
         let input = Path::new("/etc/hostname");
+        let inherited = crate::backend::sandboxprobe::inherited_cpu_limit();
         let inner: Vec<String> = [PYTHON, "-c", LIMITS_PROBE].iter().map(|s| s.to_string()).collect();
         let decoder = wrapped_output(&wrap(&inner, input, d.path()));
         let archive = wrapped_output(&wrap_archive(&inner, input, d.path()));
+        // `prlimit --cpu=30` sets soft and hard alike, so the decoder's child reads 30 whatever it inherited.
         assert_eq!(limits(&decoder, "cpu"), "30", "the decoder jail lost its runaway bound: {}", decoder);
-        // "unlimited" is the kernel's own word for RLIM_INFINITY in /proc/self/limits, so an extract is
-        // free to run past the 30 s that used to kill it.
-        assert_eq!(limits(&archive, "cpu"), "unlimited", "the archive jail still carries a CPU cap: {}", archive);
+        // With no `--cpu`, prlimit leaves both limits alone, so an extract is free to run past the 30 s that
+        // used to kill it — out to whatever this process itself carries, and not a number this test invents.
+        assert_eq!(limits(&archive, "cpu"), inherited,
+                   "the uncapped jail must inherit our CPU limit, not cap it: child {} against ours {}", archive, inherited);
         for (who, text) in [("decoder", &decoder), ("archive", &archive)] {
             assert_eq!(limits(text, "as"), TWO_GIB_TEXT,
                        "the {} jail must keep the address-space cap: {}", who, text);

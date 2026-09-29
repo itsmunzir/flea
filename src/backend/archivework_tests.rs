@@ -1,6 +1,16 @@
 use super::*;
 use crate::backend::testdir::TestDir;
 
+// The sandbox tests' limits probe, cut to the one field a runner can report: `run_boxed` nulls the
+// child's stdout, so the probe writes the soft `Max cpu time` the kernel enforced into the job's own
+// writable directory instead, and the caller reads it back. That is the value that was applied, not
+// the argument the argv asked for. `OUT` is replaced with the job's absolute writable path.
+const CPU_LIMIT_PROBE: &str = r#"
+def field(path, prefix, column):
+    return next(l.split()[column] for l in open(path) if l.startswith(prefix))
+open("OUT/cpu.txt", "w").write(field("/proc/self/limits", "Max cpu time", 3) + "\n")
+"#;
+
 #[test]
 fn a_work_directory_is_made_beside_the_destination_and_goes_with_its_own_drop() {
     let d = TestDir::new("archwork");
@@ -104,6 +114,31 @@ fn a_killed_tool_is_reported_as_killed_rather_than_as_a_bad_archive() {
     assert!(!killed.msg.contains("failed"), "and must not read as the old empty-stderr fallback: {}", killed.msg);
     let exited = run_boxed("archive", vec!["/usr/bin/false".to_string()], d.path(), &work.dir).unwrap_err();
     assert!(exited.msg.contains("exited with status 1"), "an exit is reported as an exit: {}", exited.msg);
+}
+
+// Issue #211's split, at the runner each job really gets rather than at the argv beside it. Compress and
+// convert go through `run_boxed`, which blocks with no cancel token, so their child must still be held to
+// the decoder's 30 CPU seconds: that cap is the only stop a tool that never exits can meet, and without
+// it #211 would have turned these two into the indefinite wait the review named. Extract goes through
+// `run_boxed_cancellable`, so its child must inherit this process's CPU limit instead, uncapped. The
+// probe reports what the kernel enforced from inside each runner's own jail.
+#[test]
+fn a_blocking_job_keeps_the_cpu_cap_that_an_extract_inherits_uncapped() {
+    if crate::backend::sandboxprobe::skipped() { return; }
+    let d = TestDir::new("archworkcpu");
+    let written = d.join("cpu.txt");
+    let probe = CPU_LIMIT_PROBE.replace("OUT", &d.path().to_string_lossy());
+    let inner = || vec!["/usr/bin/python3".to_string(), "-c".to_string(), probe.clone()];
+    let input = Path::new("/etc/hostname");
+    run_boxed("archive", inner(), input, d.path()).expect("the blocking runner's prober exits 0");
+    let blocking = std::fs::read_to_string(&written).expect("the blocking job wrote no limit");
+    assert_eq!(blocking.trim(), "30", "compress and convert must keep the decoder's CPU cap: {}", blocking);
+    std::fs::remove_file(&written).expect("the blocking probe's file is removed between the two arms");
+    run_boxed_cancellable("archive", inner(), input, d.path(), &AtomicBool::new(false))
+        .expect("the cancellable runner's prober exits 0");
+    let extracting = std::fs::read_to_string(&written).expect("the extract wrote no limit");
+    assert_eq!(extracting.trim(), crate::backend::sandboxprobe::inherited_cpu_limit(),
+               "an extract must inherit our CPU limit rather than be capped: {}", extracting);
 }
 
 // The parser must cancel while a real jailed child holds stdout open after one bounded line.
